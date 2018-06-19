@@ -1,0 +1,489 @@
+contract POD{
+    address public seller;
+    address public buyer;
+    address public nextCourier;
+    bytes32 keyHash;
+    string public TermsIPFS_Hash;//Terms and conditions agreement IPFS Hash
+    address public attestaionAuthority; //party that attested the smart contract12
+    uint constant public itemPrice = 2 ether;
+    address public child;
+    address public endofchain;
+    bytes32 itemID;
+   Buyer_Transporter BT;
+   CourierService CS;
+    bool public nextHop;//it becomes true if there is a need for a CourierService Contract
+    uint constant public transportationfees = 0.2 ether;
+     enum  contractState {waitingForVerificationbySeller, waitingForVerificationbyTransporter, waitingForVerificationbyBuyer,
+                        MoneyWithdrawn, PackageAndTransporterKeyCreated, ItemOnTheWayToBuyer,ItemOnTheWayToNextCourier,SuccessfulKeyVerificationByBuyer,
+                        BuyerConfirmationDone, ArrivedToDestinationKeyWithBuyer, 
+                        SuccessfulKeyVerification, PaymentSettledSuccess, DisputeVerificationFailure, EtherWithArbitrator, 
+                        CancellationRefund, Aborted}
+    contractState public state;
+    mapping(address=>bool)cancellable;
+    uint startdeliveryBlocktime;//time of start of delivery
+    uint deliveryDuration;//how long should the delivery take
+    //modifiers
+    modifier costs(){
+       require(msg.value == 2*itemPrice);
+       _;
+   }
+    modifier OnlySeller()
+    {
+        require(msg.sender == seller);
+        _;
+    }
+    modifier OnlyBuyer(){
+        require(msg.sender == buyer);
+        _;
+    }
+    modifier OnlyNextCourier(){
+        require(msg.sender == nextCourier);
+        _;
+    }
+    modifier OnlySeller_Buyer_NextCourier(){
+        require(msg.sender == seller || msg.sender == buyer || msg.sender == nextCourier);
+        _;
+    }
+    modifier OnlyChild(){
+        require(msg.sender == child);
+        _;
+    }
+    modifier OnlyBTContract(){//end of chain contract
+        require(msg.sender == endofchain);
+        _;
+    }
+    //events
+    event TermsAndConditionsSignedBy(string info, address entityAddress);
+    event collateralWithdrawnSuccessfully(string info, address entityAddress);
+    event CancellationReuest(address entityAddress, string info, string reason);
+    event RefundDueToCancellation(string info);
+    event PackageCreatedBySeller(string info, address entityAddress);
+    event PackageIsOnTheWay(string info, address entityAddress);
+    event BuyerConfirmsTransporterArrival(string info, address entityAddress);
+    event TransporterGaveKeyToBuyer(string info, address entityAddress);
+    event SuccessfulVerification(string info, address entityAddress);
+    event DisputeVerificationFailure(string info, address entityAddress);
+    event BalanceTransferredFromMainContract(string info, address child);
+    
+    //constructor
+    function POD(){
+        seller = 0xca35b7d915458ef540ade6068dfe2f44e8fa733c;
+        buyer= 0x4b0897b0513fdc7c541b6d9d7e929c4e5364d2db;
+        nextCourier = 0x14723a09acff6d2a60dcdf7aa4aff308fddc160c;
+        keyHash =0x73972c90697232c4dedc5c98e01645d84378e838a42e730ab95623a361262eff;//keccak256  hash of happy
+        TermsIPFS_Hash = "QmWWQSuPMS6aXCbZKpEjPHPUZN2NjB3YrhJTHsV4X3vb2td";
+        attestaionAuthority = 0xdd870fa1b7c4700f2bd7f44238821c26f7392148;
+        
+        itemID = 0x378032c1a780b9ab6b0e29afb705ee508a386ea90ef4969048ce0ae92fd0d6ad;
+        state = contractState.waitingForVerificationbySeller;
+        cancellable[seller] = true;
+        cancellable[buyer]=true;
+        cancellable[nextCourier]=true;
+       
+        deliveryDuration = 7 days;//7 days for deivery
+        nextHop = false;
+    }
+    function setState (contractState cs) OnlyChild{
+        state = cs;
+    }
+   
+    function setEndOfChainAddress(address ad) OnlySeller{//seller set the address once the new contract is created
+        endofchain = ad;
+        BT = Buyer_Transporter(ad);
+    }
+   
+    function cancelTransaction(string reason)OnlySeller_Buyer_NextCourier{
+     require(cancellable[msg.sender] == true);
+     state = contractState.CancellationRefund;
+     //everyone gets a refund
+    
+     seller.transfer(2*itemPrice);
+     buyer.transfer(2*itemPrice);
+     nextCourier.transfer(2*itemPrice);
+     CancellationReuest(msg.sender, " has requested a cancellation due to: ", reason );
+     state = contractState.Aborted;
+     selfdestruct(msg.sender);
+    }
+    function SignTermsAndConditions() payable costs OnlySeller_Buyer_NextCourier{
+        if(msg.sender == seller){
+            require(state == contractState.waitingForVerificationbySeller);
+            TermsAndConditionsSignedBy("Terms and Conditiond verified : ", msg.sender);
+            collateralWithdrawnSuccessfully("Double deposit is withdrawn successfully from: ", msg.sender);
+            state = contractState.waitingForVerificationbyTransporter;
+        }else if(msg.sender == nextCourier)
+        {
+            require(state == contractState.waitingForVerificationbyTransporter);
+            TermsAndConditionsSignedBy("Terms and Conditiond verified : ", msg.sender);
+            collateralWithdrawnSuccessfully("Double deposit is withdrawn successfully from: ", msg.sender);
+            state = contractState.waitingForVerificationbyBuyer;
+        }
+        else if(msg.sender == buyer){
+            require(state == contractState.waitingForVerificationbyBuyer);
+            TermsAndConditionsSignedBy("Terms and Conditiond verified : ", msg.sender);
+            collateralWithdrawnSuccessfully("Double deposit is withdrawn successfully from: ", msg.sender);
+            state = contractState.MoneyWithdrawn;
+            
+
+        }
+    }
+     //sender or transporter can cancel the transaction before the package is created with the key. 
+    function createPackageAndKey() OnlySeller {
+        require(state == contractState.MoneyWithdrawn);
+        PackageCreatedBySeller("Package created and Key given to transporter by the sender ", msg.sender);
+        state = contractState.PackageAndTransporterKeyCreated;
+        startdeliveryBlocktime = block.timestamp;//save current time
+        cancellable[msg.sender] = false;
+        cancellable[nextCourier]=false;
+       
+    }
+    
+    //receiver can cancel as long as the package is not with the transporter
+    function deliverPackage(address destination, address childContractAddress) OnlyNextCourier {
+        require(state == contractState.PackageAndTransporterKeyCreated);
+        startdeliveryBlocktime = block.timestamp;//save the delivery time
+        cancellable[buyer] = false;
+         child = childContractAddress;
+        if(destination == buyer)//no hops or multiple transporters needed
+        {
+            PackageIsOnTheWay("The package is being delivered and the key is received by the ", msg.sender);
+            state = contractState.ItemOnTheWayToBuyer;
+            BT = Buyer_Transporter(childContractAddress);
+           
+        }
+        else{// multiple couriers needed, create a transporter to transporter conract
+            state = contractState.ItemOnTheWayToNextCourier;
+             nextHop = true;
+             CS = CourierService(childContractAddress);
+        }
+    }
+   //this fucntion is called from another contract to transfer Ether of the current contract 
+    function transferEther(address entity) OnlyChild{
+        
+        entity.transfer(this.balance);
+    }
+    //this function can only be called at the end by the last contract in the chain
+    function settlePayment(contractState st) OnlyBTContract payable{//this contract has the deposit of the seller, buyer, transporter1 
+        require(st == contractState.SuccessfulKeyVerificationByBuyer);//check if the passed state is sucessful
+        state = contractState.SuccessfulKeyVerificationByBuyer;//set state of current contract to SuccessfulKeyVerificationByBuyer
+        //pay for the transporter then transfer the balance
+       
+        nextCourier.transfer((itemPrice*2)+transportationfees );//pay for the first transporter, his deposit + payment
+        child.transfer(this.balance);//transfer the balance to next contract
+        BalanceTransferredFromMainContract("Balance transferred from Main contract to ",child);
+        state = contractState.PaymentSettledSuccess;
+        //call the settle payment function of the child
+        if(nextHop){
+            CS.setState(CourierService.contractState.SuccessfulKeyVerificationByBuyer);//change state of child contract
+            CS.settlePayment();//call the settlepayment of child
+        }
+        else{//the child is the last contract (Buyer_Transporter)*/
+            
+            BT.settlePayment();
+       }
+        
+    }
+}
+
+contract CourierService{
+    address public mainContract;//the first original contract
+    address public parentContract;
+    address public childContract;
+    address public buyer;//final destination
+    address public fromCourier;
+    address public toCourier;
+    bytes32 public hash;
+    address public arbitrator;
+    string IPFSHash;
+    uint constant transportationfees = 0.2 ether;
+    POD pod ;
+    bool public nextHop;
+    address public seller;
+    enum contractState {waitingForVerificationbyDestinationTransporter, MoneyWithdrawn,ItemOnTheWayToNextCourier,ToTransporterConfirmationDone, ArrivedToDestinationKeyWithNextCourier, 
+                        SuccessfulKeyVerification, NewBuyerTranspoterContractCreated,NewCourierServiceContractCreated, SuccessfulKeyVerificationByBuyer, PaymentSettledSuccess, DisputeVerificationFailure, EtherWithArbitrator, 
+                        CancellationRefund, Refund, Aborted}
+    contractState public state;
+    uint constant itemPrice = 2 ether;
+     modifier costs(){
+       require(msg.value == 2*itemPrice);
+       _;
+   }
+   modifier OnlyBuyer(){
+       require(msg.sender == buyer);
+       _;
+   }
+    modifier OnlyDestinationAddress(){
+        require(msg.sender == toCourier);
+        _;
+    }
+     modifier OnlyFromAddress(){
+        require(msg.sender == fromCourier);
+        _;
+    }
+    modifier OnlyChild_OnlyParent(){
+        require(msg.sender == childContract || msg.sender == parentContract);
+        _;
+    }
+    modifier OnlyChild(){
+        require(msg.sender == childContract);
+        _;
+    }
+    modifier OnlyParent(){
+        require(msg.sender == parentContract);
+        _;
+    }
+    modifier OnlyDestinationAddress_OnlyChild(){
+        require(msg.sender == toCourier || msg.sender == childContract);
+        _;
+    }
+    //fall back function to receive Payment
+    function() public payable{
+        PaymentReceivedToContract("Payment just received to the courier service contract");
+    }
+    event PaymentReceivedToContract(string info);
+    event TermsAndConditionsSignedBy(string info, address entity);
+    event collateralWithdrawnSuccessfully(string info, address entity);
+    event CourierConfirmsTransporterArrival(string info, address entity, string info2, address entityTo);
+    event KeyWithNextCourier(string info, address entity);
+    event SuccessfulVerificationByToCourier(string info, address entity);
+    event DisputeVerificationFailureWithNextCourier(string info, address entity);
+    event BuyerTransporterContractCreated(string info, address childAddress);
+    event CourierServiceContractCreated(string info, address childContract);
+    event AllEtherTransferredToArbitrator(string info, address parentContract);
+    event EtherTransferredToArbitrator(string info, address contAddress);
+    event toCourierPaymentDoneSuccessfully(string info, address entity);
+    event BalanceTransferredToChildContract(string info, address entity);
+    
+    function CourierService(address mainCont, address contractParentAdd,address tCourier){
+        mainContract = mainCont;
+        parentContract = contractParentAdd;
+        fromCourier = msg.sender;
+        toCourier = tCourier;
+        IPFSHash = "QmWWQSuPMS6aXCbZKpEjPHPUZN2NjB3YrhJTHsV4X3vb2re";
+        seller = 0xca35b7d915458ef540ade6068dfe2f44e8fa733c;
+        buyer= 0x4b0897b0513fdc7c541b6d9d7e929c4e5364d2db;
+        hash = 0x73972c90697232c4dedc5c98e01645d84378e838a42e730ab95623a361262eff;//hash of happy
+        state = contractState.waitingForVerificationbyDestinationTransporter;
+       
+        arbitrator = 0x583031d1113ad414f02576bd6afabfb302140225;
+        
+        nextHop = false;
+       
+    }
+    //parent sets state during settle payment .. child sets the state during dispute
+    function setState(contractState cs) OnlyChild_OnlyParent {
+        state = cs;
+    }
+    
+    //sign the agreement terms and only the receiving transporter will pay the deposit
+    function SignTermsAndConditions() payable costs OnlyDestinationAddress(){
+            require(state == contractState.waitingForVerificationbyDestinationTransporter);
+            TermsAndConditionsSignedBy("Terms and Conditiond verified : ", msg.sender);
+            collateralWithdrawnSuccessfully("Double deposit is withdrawn successfully from: ", msg.sender);
+            state = contractState.ItemOnTheWayToNextCourier;
+    }
+   
+    function confirmTransporterArrival() OnlyDestinationAddress{
+        require(state == contractState.ItemOnTheWayToNextCourier);
+       
+        CourierConfirmsTransporterArrival("Transporter " , fromCourier , " Arrived To Destination " , msg.sender);
+        state = contractState.ToTransporterConfirmationDone;
+    }
+    function arrivedToDestination() OnlyFromAddress{
+        require(state == contractState.ToTransporterConfirmationDone);
+
+        state = contractState.ArrivedToDestinationKeyWithNextCourier;
+        KeyWithNextCourier("Key is now with next courier with address", toCourier);
+    }
+    function verifyKey(string key) OnlyDestinationAddress{
+        require(state == contractState.ArrivedToDestinationKeyWithNextCourier);
+        if(keccak256(key) == hash)
+        {
+            state = contractState.SuccessfulKeyVerification;
+            SuccessfulVerificationByToCourier("successful verification!", msg.sender);
+        }
+        else
+        {
+            state = contractState.DisputeVerificationFailure;
+            DisputeVerificationFailureWithNextCourier("Key hashes don't match", msg.sender);
+            transferEther_Dispute(state);
+            
+        }
+    }
+    function transferEther_Dispute(contractState st) OnlyDestinationAddress_OnlyChild{//either through the DestinationCourier or the parent contract
+        require(st == contractState.DisputeVerificationFailure);//require the child's state is DisputeVerificationFailure
+       arbitrator.transfer(this.balance);//transfer current contract balance
+       if(parentContract == mainContract)
+       {
+           pod = POD(mainContract);
+           pod.setState(POD.contractState.DisputeVerificationFailure);
+           pod.transferEther(arbitrator);//transfer ether of main contract to the arbitrator
+           AllEtherTransferredToArbitrator("Dipute ether transferred from main contract", mainContract);
+       }else{
+            CourierService pc  =  CourierService(parentContract);
+            pc.setState(st);
+            pc.transferEther_Dispute(state);
+            EtherTransferredToArbitrator("Dispute ether transferred from ", parentContract);
+       }
+    }
+    function settlePayment() payable OnlyParent{
+        require(state == contractState.SuccessfulKeyVerificationByBuyer);
+        toCourier.transfer(2*itemPrice+transportationfees);//pay the transporter
+        toCourierPaymentDoneSuccessfully("Payment to to courier done ", toCourier);
+        childContract.transfer(this.balance);//transfer to the child contract
+        if(nextHop)//child is a CourierService
+        {
+         CourierService cs = CourierService(childContract);
+         cs.setState(CourierService.contractState.SuccessfulKeyVerificationByBuyer);
+         cs.settlePayment();
+        }
+        else{//child is a Buyer_Transporter (last contract)
+            Buyer_Transporter bt = Buyer_Transporter(childContract);
+            bt.settlePayment();
+        }
+        
+    }
+     function setNextContract (address destination,address child_Contract) OnlyDestinationAddress(){
+        //package received successfully by transpporter 2 without disputes
+        require(state == contractState.SuccessfulKeyVerification);
+        childContract = child_Contract;
+        if(destination == buyer)
+            {
+                    BuyerTransporterContractCreated("A new contract for buyer and transporter created with address", childContract);
+                    state = contractState.NewBuyerTranspoterContractCreated;
+            }
+            else{//a transporter to transporter contract has already been created created
+               
+                CourierServiceContractCreated("A new courierSeverice Contract Created with address", childContract);
+                state = contractState.NewCourierServiceContractCreated;
+                nextHop = true;
+            }
+    }
+    
+}
+
+contract Buyer_Transporter {
+    address public mainContract;//the first original contract
+    address public parentContract;//the previous contract in the chain
+    address public buyer;
+    address public seller;
+    address public transporter;
+    address public arbitrator;
+    bytes32 public keyHash;
+    uint public deliveryArrivalTime;//expected arrival time of delivery
+    enum contractState {ItemOnTheWayToBuyer,BuyerConfirmationDone, ArrivedToDestinationKeyWithBuyer, 
+                        SuccessfulKeyVerificationByBuyer, PaymentSettledSuccess, DisputeVerificationFailure, DisputeVerificationFailureExceedTime,
+                        EtherWithArbitrator}
+    contractState public state;
+    uint constant itemPrice = 2 ether;
+    POD pod;
+    uint startdeliveryBlocktime;//time of start of delivery
+    uint deliveryDuration;//how long should the delivery take
+    //constructor
+    function Buyer_Transporter(address mainCont, address contractParentAdd){
+        mainContract = mainCont;
+        parentContract = contractParentAdd;
+        transporter = msg.sender;//creater of the contract
+        seller = 0xca35b7d915458ef540ade6068dfe2f44e8fa733c;
+        buyer= 0x4b0897b0513fdc7c541b6d9d7e929c4e5364d2db;
+        keyHash = 0x73972c90697232c4dedc5c98e01645d84378e838a42e730ab95623a361262eff;//hash of happy
+        state = contractState.ItemOnTheWayToBuyer;
+        arbitrator = 0x583031d1113ad414f02576bd6afabfb302140225;
+       
+        pod = POD (mainContract);//instance of the main contract with its adddress
+    }
+    //modifiers
+    modifier OnlyBuyer(){
+        require(msg.sender == buyer);
+        _;
+    }
+    modifier OnlyTransporter(){
+        require(msg.sender == transporter);
+        _;
+    }
+    modifier OnlyParent(){
+        require(msg.sender == parentContract);
+        _;
+    }
+     //fall back function to receive Payment
+    function() public payable{
+        PaymentReceivedToBT_Contract("Payment just received to the buyer transporter contract");
+    }
+    
+    //events
+    event PaymentReceivedToBT_Contract(string info);
+    event BuyerRequestedAllEtherTransferredToArbitrator(string info, address contractAddress);
+    event DisputeVerificationFailure(string info, address contractAddress);
+    event BuyerConfirmsTransporterArrival(string info, address trans, string info1);
+    event KeyWithBuyer(string info);
+    event SuccessfulVerificationOfKeysByBuyer(string info, address buy);
+    event DisputeVerificationFailureBetweenBuyerAndTransporter(string info, address buy);
+    event EtherTransferredToBuyerAndSeller(string info);
+    event ExceedDeliveryTimeCancellationByBuyer(string info, address buyer);
+   
+    //dipute .. no need to transfer any ether from this contract..just from the previous contracts
+    function transferEther_Dispute() OnlyBuyer{
+        require(state == contractState.DisputeVerificationFailure);
+        
+       
+        if(parentContract == mainContract)//the previous contract is the main contract (POD)
+        {
+            
+            pod.setState(POD.contractState.DisputeVerificationFailure);
+            pod.transferEther(arbitrator);//transfer ether of main contract to arbitrator
+            BuyerRequestedAllEtherTransferredToArbitrator("Dipute ether transferred from main contract", mainContract);            
+        }
+        else //the previous contract is a courierSeverice contract
+        {
+            CourierService pc  =  CourierService(parentContract);
+            pc.setState(CourierService.contractState.DisputeVerificationFailure);
+            pc.transferEther_Dispute(CourierService.contractState.DisputeVerificationFailure);
+            DisputeVerificationFailure("Dispute called in parent contract ", parentContract);
+        }
+        
+    }
+    function confirmTransporterArrival() OnlyBuyer{
+        require(state == contractState.ItemOnTheWayToBuyer);
+        BuyerConfirmsTransporterArrival("Transporter " , transporter , " Arrived To Destination ");
+        state = contractState.BuyerConfirmationDone;
+    }
+    function arrivedToDestination() OnlyTransporter{
+        require(state == contractState.BuyerConfirmationDone);
+        state = contractState.ArrivedToDestinationKeyWithBuyer;
+        KeyWithBuyer("Key is now with Buyer, waiting for verification");
+    }
+    function verifyKey(string key) OnlyBuyer{
+        require(state >= contractState.ArrivedToDestinationKeyWithBuyer);
+        if(keccak256(key) == keyHash)
+        {
+            state = contractState.SuccessfulKeyVerificationByBuyer;
+            SuccessfulVerificationOfKeysByBuyer("successful verification!, payment settled soon", msg.sender);
+           pod.settlePayment(POD.contractState.SuccessfulKeyVerificationByBuyer);
+        }
+        else
+        {
+            state = contractState.DisputeVerificationFailure;
+            DisputeVerificationFailureBetweenBuyerAndTransporter("Key hashes don't match", msg.sender);
+            transferEther_Dispute();
+        }
+    }
+    function exceedDeliveryTimeMain() OnlyBuyer{
+        require(state == contractState.ItemOnTheWayToBuyer);
+        if(block.timestamp > (startdeliveryBlocktime+deliveryDuration))
+        {
+            state = contractState.DisputeVerificationFailureExceedTime;
+            ExceedDeliveryTimeCancellationByBuyer("Dispute: Buyer refuses order due to exceeding delivery time", msg.sender);
+            transferEther_Dispute();
+        }
+    }
+    //payment function called by the parent of this contract
+    function settlePayment() payable OnlyParent{
+         require(state == contractState.SuccessfulKeyVerificationByBuyer);
+        //pay buyer and seller
+        buyer.transfer(itemPrice);//transfer to the buyer the extra deposited item itemPrice
+        seller.transfer(this.balance);//transfer what is left to the seller
+        state = contractState.PaymentSettledSuccess;
+        EtherTransferredToBuyerAndSeller("Payment Settlement Done Successfully!");
+    }
+    
+   
+}
